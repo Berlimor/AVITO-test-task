@@ -1,16 +1,28 @@
 package main
 
 import (
+	"database/sql"
 	"net/http"
 	"os"
-	"strings"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"github.com/lib/pq"
 )
 
 type UserWithSegment struct {
-	ID			string		`json:"id"`
-	Segments	string		`json:"segments"`
+	ID			int				`json:"id"`
+	Segments	[]string		`json:"segments"`
+}
+
+type Segment struct {
+	Name		string		`json:"name"`
+}
+
+type AddingSegmentsToUser struct {
+	SegmentsToAdd		[]string		`json:"add-segments"`
+	SegmentsToDelete	[]string		`json:"delete-segments"`
+	UserID				int				`json:"user-id"`
 }
 
 func main() {
@@ -22,56 +34,169 @@ func main() {
 	}
 
 	r := gin.Default()
-	r.GET("/users", ListUsers)
-	r.GET("/users/:id", GetUsersSegments)
-	r.POST("/users/", AddSegmentsToUser)
+	r.GET("/users", env.ListUsers)
+	r.GET("/users/:id", env.GetUserByID)
+	r.POST("/users/", env.AddSegmentsToUser)
 
-	r.POST("/segments/:segmentName", CreateSegment)
-	r.DELETE("/segments/:segmentName", DeleteSegment)
+	r.POST("/segments/:segmentName", env.CreateSegment)
+	r.DELETE("/segments/:segmentName", env.DeleteSegment)
 
 	port := os.Getenv("PORT") 
 	if port == "" {
 		port = "8080"
 	}
-	r.Run(port)
+	r.Run("localhost:%v", port)
 }
 
-func ListUsers(c *gin.Context) {
+func (env Env) ListUsers(c *gin.Context) {
 	query := "SELECT * FROM users"
+	rows, err := env.DB.Query(query)
 
-}
+	switch err{
+	case sql.ErrNoRows:
+		defer rows.Close()
+		c.IndentedJSON(http.StatusInternalServerError, "No rows found in users table")
+		return
 
-func GetUsersSegments(c *gin.Context) {
-	var user UserWithSegment
-	if err := c.BindJSON(&user); err != nil {
-		c.IndentedJSON(http.StatusInternalServerError, "Could not bind JSON")
+	case nil:
+		defer rows.Close()
+		result := make([]UserWithSegment, 0)
+		for rows.Next() {
+			var id int 
+			var segments []string
+			err = rows.Scan(&id, pq.Array(&segments))
+			if err != nil {
+				c.IndentedJSON(http.StatusInternalServerError, "Error scaning rows")
+				return
+			}
+			result = append(result, UserWithSegment{id, segments})
+		}
+		c.IndentedJSON(http.StatusOK, result)
+		return
+
+	default:
+		defer rows.Close()
+		c.IndentedJSON(http.StatusInternalServerError, "Case default error")
 		return
 	}
 }
 
-func CreateSegment(c *gin.Context) {
-	var user UserWithSegment
-	if err := c.BindJSON(&user); err != nil {
-		c.IndentedJSON(http.StatusInternalServerError, "Could not bind JSON")
+func (env Env) GetUserByID(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.IndentedJSON(http.StatusBadRequest, "Invalid id parameter")
 		return
 	}
-	newSegment := user.Segments
+
+	query := "SELECT * FROM users WHERE id=$1"
+	row := env.DB.QueryRow(query, id)
+	var segments []string
+
+	err = row.Scan(&id, pq.Array(&segments))
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, "Error scaning a row")
+	}
+	c.IndentedJSON(http.StatusOK, UserWithSegment{id, segments})
 }
 
-func DeleteSegment(c *gin.Context) {
-	var user UserWithSegment
-	if err := c.BindJSON(&user); err != nil {
+func (env Env) CreateSegment(c *gin.Context) {
+	var segment Segment
+	if err := c.BindJSON(&segment); err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, "Could not bind JSON")
 		return
 	}
-	segmentToDelete := user.Segments
+	newSegment := segment.Name
+
+	query := "INSERT INTO segments(segment) VALUES($1)"
+	result, err := env.DB.Exec(query, newSegment)
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, "Could not insert the new segment instance")
+		return
+	}
+
+	_, err = result.RowsAffected()
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, "An error occured while checking the returned result")
+		return
+	}
+
+	c.IndentedJSON(http.StatusOK, "Segment created successfully")
 }
 
-func AddSegmentsToUser(c *gin.Context) {
-	var user UserWithSegment
-	if err := c.BindJSON(&user); err != nil {
+func (env Env) DeleteSegment(c *gin.Context) {
+	var segment Segment
+	if err := c.BindJSON(&segment); err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, "Could not bind JSON")
 		return
 	}
-	segmentsToAdd := strings.Split(user.Segments, ",")
+	segmentToDelete := segment.Name
+
+	query := "DELETE FROM segments WHERE segment=$1"
+	result, err := env.DB.Exec(query, segmentToDelete)
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, "Could not delete specified segment instance")
+		return
+	}
+
+	_, err = result.RowsAffected()
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, "An error occured while checking the returned result")
+		return
+	}
+
+	c.IndentedJSON(http.StatusOK, "Segment deleted successfully")
+}
+
+func (env Env) AddSegmentsToUser(c *gin.Context) {
+	var request AddingSegmentsToUser
+	if err := c.BindJSON(&request); err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, "Could not bind JSON")
+		return
+	}
+	segmentsToAdd := request.SegmentsToAdd
+
+	segmentsToDelete := request.SegmentsToDelete
+
+	userID := request.UserID
+
+	query := "SELECT * FROM users WHERE id=$1"
+	row := env.DB.QueryRow(query, userID)
+	var oldID int
+	var oldSegments []string
+	err := row.Scan(&oldID, pq.Array(&oldSegments))
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, "Error scaning a row")
+		return
+	}
+	uniqueOldSegments := GetMap(oldSegments)
+
+	for _, segment := range segmentsToDelete {
+		if _, unique := uniqueOldSegments[segment]; unique {
+			delete(uniqueOldSegments, segment)
+		}
+	}
+
+	for _, segment := range segmentsToAdd {
+		if _, unique := uniqueOldSegments[segment]; !unique {
+			uniqueOldSegments[segment] = true
+		}
+	}
+
+	var updatedSegments []string
+	for key := range uniqueOldSegments {
+		updatedSegments = append(updatedSegments, key)
+	}
+
+	query = "UPDATE users SET segments=$1 WHERE id=$2"
+	result, err := env.DB.Exec(query, updatedSegments, userID)
+	if err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, "Could not update")
+		return
+	}
+
+	if _, err = result.RowsAffected(); err != nil {
+		c.IndentedJSON(http.StatusInternalServerError, "An error occured while checking the returned result")
+	}
+
+	c.IndentedJSON(http.StatusOK, "User segments updated successfully")
 }
