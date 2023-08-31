@@ -1,0 +1,33 @@
+version: '3.0'
+
+networks:
+  db:
+
+services:
+  db:
+    image: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: avito-user
+      POSTGRES_PASSWORD: avito123
+      POSTGRES_DB: avito-test-task
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks: 
+      - db
+  
+  backend:
+    build: .
+    ports:
+      - 8000:8000
+    depends_on:
+      - db
+    networks:
+      - db
+    environment:
+      DATABASE_URI: "postgresql://avito-user:avito123@db:5432/avito-test-task?sslmode=disable"
+      
+volumes:
+  pgdata: { }

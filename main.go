@@ -2,8 +2,8 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
 	"net/http"
-	"os"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -32,20 +32,28 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	defer env.DB.Close()
+
+	// Create tables
+	err = env.CreateUsersTable()
+	if err != nil {
+		panic(err)
+	}
+	err = env.CreateSegmentsTable()
+	if err != nil {
+		panic(err)
+	}
 
 	r := gin.Default()
 	r.GET("/users", env.ListUsers)
 	r.GET("/users/:id", env.GetUserByID)
-	r.POST("/users/", env.AddSegmentsToUser)
+	r.POST("/users", env.AddSegmentsToUser)
 
-	r.POST("/segments/:segmentName", env.CreateSegment)
-	r.DELETE("/segments/:segmentName", env.DeleteSegment)
+	r.POST("/segments", env.CreateSegment)
+	r.DELETE("/segments", env.DeleteSegment)
 
-	port := os.Getenv("PORT") 
-	if port == "" {
-		port = "8080"
-	}
-	r.Run("localhost:%v", port)
+
+	r.Run(":8000")
 }
 
 func (env Env) ListUsers(c *gin.Context) {
@@ -59,7 +67,6 @@ func (env Env) ListUsers(c *gin.Context) {
 		return
 
 	case nil:
-		defer rows.Close()
 		result := make([]UserWithSegment, 0)
 		for rows.Next() {
 			var id int 
@@ -76,7 +83,7 @@ func (env Env) ListUsers(c *gin.Context) {
 
 	default:
 		defer rows.Close()
-		c.IndentedJSON(http.StatusInternalServerError, "Case default error")
+		c.IndentedJSON(http.StatusInternalServerError, "There are no users in the database")
 		return
 	}
 }
@@ -110,7 +117,8 @@ func (env Env) CreateSegment(c *gin.Context) {
 	query := "INSERT INTO segments(segment) VALUES($1)"
 	result, err := env.DB.Exec(query, newSegment)
 	if err != nil {
-		c.IndentedJSON(http.StatusInternalServerError, "Could not insert the new segment instance")
+		error := fmt.Sprintf("Error %v", err)
+		c.IndentedJSON(http.StatusInternalServerError, error)
 		return
 	}
 
@@ -154,26 +162,28 @@ func (env Env) AddSegmentsToUser(c *gin.Context) {
 		return
 	}
 	segmentsToAdd := request.SegmentsToAdd
-
 	segmentsToDelete := request.SegmentsToDelete
-
 	userID := request.UserID
 
 	query := "SELECT * FROM users WHERE id=$1"
 	row := env.DB.QueryRow(query, userID)
 	var oldID int
 	var oldSegments []string
-	err := row.Scan(&oldID, pq.Array(&oldSegments))
-	if err != nil {
-		c.IndentedJSON(http.StatusInternalServerError, "Error scaning a row")
+	if err := row.Scan(oldID, pq.Array(&oldSegments)); err == sql.ErrNoRows {
+		query = "INSERT INTO users VALUES($1, $2)"
+		_, err = env.DB.Exec(query, userID, segmentsToAdd)
+		if err != nil {
+			c.IndentedJSON(http.StatusInternalServerError, "Could not insert user and it's segments")
+			return
+		}
+		c.IndentedJSON(http.StatusOK, "Segments successfully added")
 		return
 	}
+	
 	uniqueOldSegments := GetMap(oldSegments)
 
 	for _, segment := range segmentsToDelete {
-		if _, unique := uniqueOldSegments[segment]; unique {
-			delete(uniqueOldSegments, segment)
-		}
+		delete(uniqueOldSegments, segment)
 	}
 
 	for _, segment := range segmentsToAdd {
@@ -184,11 +194,20 @@ func (env Env) AddSegmentsToUser(c *gin.Context) {
 
 	var updatedSegments []string
 	for key := range uniqueOldSegments {
-		updatedSegments = append(updatedSegments, key)
+		// Checking if the segment occures in segments table
+		query = "SELECT exists(SELECT * FROM segments WHERE segment=$1)"
+		var exists bool
+		err := env.DB.QueryRow(query, key).Scan(&exists)
+		if err != nil {
+			c.IndentedJSON(http.StatusInternalServerError, "Error validating the segment")
+		}
+		if exists {
+			updatedSegments = append(updatedSegments, key)
+		}
 	}
 
-	query = "UPDATE users SET segments=$1 WHERE id=$2"
-	result, err := env.DB.Exec(query, updatedSegments, userID)
+	query = "UPDATE users SET segments=$1 WHERE id=$2;"
+	result, err := env.DB.Exec(query, pq.Array(updatedSegments), userID)
 	if err != nil {
 		c.IndentedJSON(http.StatusInternalServerError, "Could not update")
 		return
